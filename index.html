@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Solana Dex Bot</title>
+  <script src="https://unpkg.com/@solana/web3.js@latest/lib/index.iife.js"></script>
+  <style>
+    body { font-family: sans-serif; padding: 20px; background: #f0f0f0; }
+    #log { white-space: pre-wrap; background: #fff; padding: 10px; border-radius: 8px; max-height: 500px; overflow-y: auto; }
+    button { padding: 10px 20px; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>Solana Dex Bot</h1>
+  <p>Bot wykrywa tokeny z Dexscreener, kupuje przez Jupiter i sprzedaje z zyskiem</p>
+  <button id="connect">Połącz Phantom</button>
+  <div id="log"></div>
+
+  <script>
+    const log = (msg) => {
+      document.getElementById('log').textContent += `\n${msg}`;
+    };
+
+    let connection;
+    let provider;
+    let publicKey;
+    let boughtToken = null;
+    let buyAmount = 0.1; // w SOL
+    let targetProfitUSD = 2; // 2 USD zysku
+
+    document.getElementById('connect').onclick = async () => {
+      try {
+        provider = window.solana;
+        if (!provider?.isPhantom) return alert("Phantom Wallet nie znaleziony");
+        const resp = await provider.connect();
+        publicKey = resp.publicKey;
+        log("Połączono z: " + publicKey.toString());
+        connection = new solanaWeb3.Connection(solanaWeb3.clusterApiUrl('mainnet-beta'));
+        startBot();
+      } catch (err) {
+        log("Błąd połączenia: " + err);
+      }
+    };
+
+    async function startBot() {
+      log("Startuję bota... Szukam tokenów z Dexscreener");
+      setInterval(async () => {
+        if (boughtToken) {
+          await monitorPriceAndSell(boughtToken);
+          return;
+        }
+        try {
+          const res = await fetch("/.netlify/functions/dex");
+          const data = await res.json();
+          const hot = data.pairs.filter(p => parseFloat(p.priceChange.h1) > 50 && parseFloat(p.volume.h1) > 10000);
+          if (hot.length) {
+            const top = hot[0];
+            log(`Wykryto token: ${top.baseToken.symbol} (${top.baseToken.address})`);
+            const success = await trySwapWithJupiter(top.baseToken.address);
+            if (success) {
+              boughtToken = top.baseToken.address;
+            }
+          }
+        } catch (e) {
+          log("Błąd API Dexscreener: " + e);
+        }
+      }, 15000);
+    }
+
+    async function trySwapWithJupiter(tokenMint) {
+      try {
+        const amountIn = buyAmount * 1e9; // 0.1 SOL w lamportach
+        const jupiterUrl = `https://quote-api.jup.ag/v6/swap`;
+
+        const quoteRes = await fetch(`${jupiterUrl}?inputMint=So11111111111111111111111111111111111111112&outputMint=${tokenMint}&amount=${amountIn}&slippageBps=500&userPublicKey=${publicKey.toString()}&onlyDirectRoutes=false`);
+        const swapData = await quoteRes.json();
+
+        if (!swapData.swapTransaction) {
+          log("Brak transakcji swap z Jupiter.");
+          return false;
+        }
+
+        const swapTx = swapData.swapTransaction;
+        const txBuf = Buffer.from(swapTx, 'base64');
+        const tx = solanaWeb3.Transaction.from(txBuf);
+        tx.feePayer = publicKey;
+        tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+
+        const signed = await provider.signTransaction(tx);
+        const txid = await connection.sendRawTransaction(signed.serialize());
+        log(`Kupiono token. TX: https://solscan.io/tx/${txid}`);
+        return true;
+      } catch (e) {
+        log("Błąd przy swapie z Jupiter: " + e);
+        return false;
+      }
+    }
+
+    async function getTokenBalance(tokenMint) {
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(publicKey, {
+        mint: new solanaWeb3.PublicKey(tokenMint),
+      });
+
+      const accountInfo = tokenAccounts.value[0]?.account?.data?.parsed?.info;
+      const amount = accountInfo?.tokenAmount?.uiAmount;
+      return amount || 0;
+    }
+
+    async function monitorPriceAndSell(tokenMint) {
+      try {
+        const tokenBalance = await getTokenBalance(tokenMint);
+        if (tokenBalance === 0) {
+          log("Brak balansu tokena, pomijam");
+          return;
+        }
+
+        const decimals = 6;
+        const amountLamports = Math.floor(tokenBalance * Math.pow(10, decimals));
+        const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${amountLamports}&slippageBps=500`;
+        const quoteRes = await fetch(quoteUrl);
+        const quoteData = await quoteRes.json();
+
+        const outSol = quoteData.outAmount / 1e9;
+        const profit = outSol - buyAmount;
+        const profitUSD = profit * 100;
+
+        if (profitUSD >= targetProfitUSD) {
+          log(`Zysk osiągnięty (${profitUSD.toFixed(2)} USD). Sprzedaję token...`);
+          await sellTokenWithJupiter(tokenMint, amountLamports);
+          boughtToken = null;
+        } else {
+          log(`Cena śledzona. Aktualny zysk: ${profitUSD.toFixed(2)} USD`);
+        }
+      } catch (e) {
+        log("Błąd monitorowania ceny: " + e);
+      }
+    }
+
+    async function sellTokenWithJupiter(tokenMint, amountLamports) {
+      try {
+        const jupiterUrl = `https://quote-api.jup.ag/v6/swap?inputMint=${tokenMint}&outputMint=So11111111111111111111111111111111111111112&amount=${amountLamports}&slippageBps=500&userPublicKey=${publicKey.toString()}&onlyDirectRoutes=false`;
+        const swapRes = await fetch(jupiterUrl);
+        const swapData = await swapRes.json();
+
+        if (!swapData.swapTransaction) {
+          log("Brak transakcji swap (sprzedaży).");
+          return;
+        }
+
+        const txBuf = Buffer.from(swapData.swapTransaction, 'base64');
+        const tx = solanaWeb3.Transaction.from(txBuf);
+        tx.feePayer = publicKey;
+        tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+
+        const signed = await provider.signTransaction(tx);
+        const txid = await connection.sendRawTransaction(signed.serialize());
+        log(`Sprzedano token. TX: https://solscan.io/tx/${txid}`);
+      } catch (e) {
+        log("Błąd przy sprzedaży tokena: " + e);
+      }
+    }
+  </script>
+</body>
+</html>
